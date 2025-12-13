@@ -21,6 +21,7 @@ attachment::att_amend_desc()
 ## Add modules ----
 ## Create a module infrastructure in R/
 golem::add_module(name = "nba_viz", with_test = FALSE)
+golem::add_module(name="nba_pred",with_test = FALSE)
 
 ## Add helper functions ----
 ## Creates fct_* and utils_*

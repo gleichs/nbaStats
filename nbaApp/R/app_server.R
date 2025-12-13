@@ -5,5 +5,6 @@
 #' @import shiny
 #' @noRd
 app_server <- function(input, output, session) {
-  mod_nba_viz_server("nba_viz_1")
+  out <- mod_nba_viz_server("nba_viz_1")
+  mod_nba_pred_server("nba_pred_1",out)
 }
