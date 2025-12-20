@@ -33,6 +33,7 @@ golem_add_external_resources <- function() {
       path = app_sys("app/www"),
       app_title = "nbaApp"
     ),
-    waiter::use_waiter()
+    waiter::use_waiter(),
+    shinyjs::useShinyjs()
   )
 }
