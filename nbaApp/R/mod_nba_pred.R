@@ -12,10 +12,22 @@ mod_nba_pred_ui <- function(id) {
   tagList(
     bslib::page_sidebar(
       sidebar=bslib::sidebar(
-        shiny::selectInput(ns("team"),label="Select Team",choices=c(NULL)),
+        shiny::selectInput(ns("team"),label="Select Current Team",choices=c(NULL)),
         shiny::selectInput(ns("player"),label="Select Player for Prediction",choices=c(NULL)),
         shiny::dateRangeInput(ns("dates"),label="Select Date Range for Model Training",min=NULL,max=NULL),
+        shiny::selectInput(ns("mod_type"),label="Select Model Type",choices=c("Lasso Regression","Random Forest")),
         shiny::actionButton(ns("train"),label="Train Model")
+      ),
+      bslib::layout_columns(
+        col_widths = c(6,6),
+        bslib::value_box(
+          title="RMSE",
+          value = textOutput(ns("rmse_out"))
+        ),
+        bslib::value_box(
+          title="MAE",
+          value=shiny::textOutput(ns("mae_out"))
+        )
       ),
       plotly::plotlyOutput(ns("mod_out"))
     )
@@ -29,50 +41,120 @@ mod_nba_pred_server <- function(id,out){
   moduleServer(id, function(input, output, session){
     ns <- session$ns
 
-    # Reactive
-    df_rctv <- shiny::reactiveVal(NULL)
+    # Reactives
+    df_2026 <- shiny::reactiveVal(NULL)
+    df_player <- shiny::reactiveVal(NULL)
 
-    # Observe data
+    # Observe initial data and update 2026 team names
     shiny::observeEvent(out(),{
       df <- out()
       df_2026 <- df |> dplyr::filter(yearSeason==2026)
       shiny::updateSelectInput(session=session,"team",choices=c(unique(df_2026$nameTeam)))
-      df_rctv(df_2026)
+      df_2026(df_2026)
     })
 
+    # When the team is updated, list played on that team
     shiny::observeEvent(input$team,{
       if(input$team!=""){
-        dfPlayer <- df_rctv()
-        dfPlayer <- dfPlayer |> dplyr::filter(nameTeam==input$team)
-        shiny::updateSelectInput(session=session,"player",choices=c(unique(dfPlayer$namePlayer)))
+        dfTeam <- df_2026()
+        dfTeam <- dfTeam |> dplyr::filter(nameTeam==input$team)
+        shiny::updateSelectInput(session=session,"player",choices=c(unique(dfTeam$namePlayer)))
       }
     })
 
+    # When the player is selected, update the date range
     shiny::observeEvent(input$player,{
       if(input$player!="" & input$team!=""){
         df <- out()
-        df <- df |> dplyr::filter(namePlayer==input$player & nameTeam==input$team)
-        shiny::updateDateRangeInput(session=session,"dates",min=min(df$dateGame),max=max(df$dateGame),start=min(df$dateGame),end=max(df$dateGame))
+        dfPlayer <- df |> dplyr::filter(namePlayer==input$player)
+        shiny::updateDateRangeInput(session=session,"dates",min=min(dfPlayer$dateGame),max=max(dfPlayer$dateGame),start=min(dfPlayer$dateGame),end=max(dfPlayer$dateGame)-30)
       }
     })
 
+    # When train is executed and lasso regression is selected
     shiny::observeEvent(input$train,{
-      browser()
+      req(input$mod_type=="Lasso Regression")
+
+      # Select predictor variables
       df_pred <- out()
-      df_pred <- df_pred |> dplyr::filter(nameTeam==input$team & namePlayer==input$player & dateGame <= input$dates[2] & dateGame >= input$dates[1])
-      y <- df_pred$pts
-      X <- df_pred[c("numberGameTeamSeason","isB2B","locationGame","countDaysRestTeam","slugOpponent","isWin","fgm","fga","minutes","ftm","fta")]
-      X$isB2B <- as.numeric(as.factor(X$isB2B))
-      X$locationGame <- as.numeric(as.factor(X$locationGame))
-      X$slugOpponent <- as.numeric(as.factor(X$slugOpponent))
-      X$isWin <- as.numeric(as.factor(X$isWin))
+      df_pred <- subset(df_pred,namePlayer==input$player)
+      df_pred <- df_pred[c("yearSeason","nameTeam","numberGameTeamSeason","isB2B","locationGame","countDaysRestTeam","slugOpponent","numberGamePlayerSeason","countDaysRestPlayer","pts","dateGame")]
 
-      # Fit lasso with cross-validation
+      # Convert factors to dummy numeric
+      df_pred$nameTeam <- as.numeric(as.factor(df_pred$nameTeam))
+      df_pred$isB2B <- as.numeric(as.factor(df_pred$isB2B))
+      df_pred$isB2B <- ifelse(df_pred$isB2B==1,0,1)
+      df_pred$locationGame <- as.numeric(as.factor(df_pred$locationGame))
+      df_pred$locationGame <- ifelse(df_pred$locationGame==1,0,1)
+      df_pred$slugOpponent <- as.numeric(as.factor(df_pred$slugOpponent))
+
+      # Train/test split
+      df_train <- df_pred |> dplyr::filter(dateGame <= input$dates[2] & dateGame >= input$dates[1])
+      df_test <- df_pred |> dplyr::filter(dateGame > input$dates[2])
+
+      # Prep train data
+      y <- df_train$pts
+      X <- df_train
+      X$pts <- NULL
+      X$dateGame <- NULL
+      X <- as.matrix(X)
+
+      # Fit lasso and generate predictions using train data
       cv_fit <- glmnet::cv.glmnet(X, y, alpha = 1)
+      preds_train <- predict(cv_fit, newx = X, s = "lambda.min")
 
+      # If test data are available...
+      if(nrow(df_test)>0){
+        # Prep test data
+        X_test <- df_test
+        X_test$pts <- NULL
+        X_test$dateGame <- NULL
+        X_test <- as.matrix(X_test)
 
-  })
+        # Predict using test data
+        preds_test <- predict(cv_fit, newx = X_test, s = "lambda.min")
 
+        # Wrangle predictions
+        preds_test <- as.data.frame(preds_test)
+        preds_test$dataset <- "Test"
+        preds_train <- as.data.frame(preds_train)
+        preds_train$dataset <- "Train"
+        preds <- rbind(preds_train,preds_test)
+        colnames(preds) <- c("pred","dataset")
+        df_all <- rbind(df_train,df_test)
+        preds <- cbind(preds,df_all)
+        mae <- mean(abs(df_test$pts - preds_test$lambda.min))
+        rmse <- sqrt(mean((df_test$pts - preds_test$lambda.min)^2))
+      }
+      else{
+        shiny::showModal(
+          shiny::modalDialog(
+            "No data to use for model testing. RMSE and MAE values will be calculated using training data. Error metrics should be interpreted with caution."
+          )
+        )
+        preds <- as.data.frame(preds_train)
+        preds$dataset <- "Train"
+        colnames(preds) <- c("pred","dataset")
+        preds <- cbind(preds,df_train)
+        mae <- mean(abs(preds$pts - preds$pred))
+        rmse <- sqrt(mean((preds$pts - preds$pred)^2))
+      }
+      preds_out <- ggplot2::ggplot(preds,ggplot2::aes(x=pred,y=pts,shape=dataset,color=dataset,text=paste("Predicted Points: ",round(pred,3),"\nPoints Made: ",round(pts,3),"\nDataset: ",dataset,sep="")))+
+        ggplot2::geom_point(size=2)+
+        ggplot2::geom_abline(intercept=0,slope=1,linetype="dashed")+
+        ggplot2::theme_bw(base_size=14)+
+        ggplot2::xlab("Predicted Points")+
+        ggplot2::ylab("Points Made")+
+        ggplot2::scale_color_manual(name="Dataset",values=c("red3","dodgerblue"),breaks=c("Test","Train"))+
+        ggplot2::scale_shape_manual(name="Dataset",values=c(17,16),breaks=c("Test","Train"))
+
+      output$mod_out <- plotly::renderPlotly({
+        plotly::ggplotly(preds_out,tooltip = "text")
+      })
+
+      output$mae_out <- shiny::renderText({mae})
+      output$rmse_out <- shiny::renderText({rmse})
+    })
   })
 }
 
