@@ -7,7 +7,7 @@
 app_ui <- function(request) {
   tagList(
     bslib::page_navbar(
-      bslib::nav_panel("Visualize Players",icon=bsicons::bs_icon("graph-up"),mod_nba_viz_ui("nba_viz_1")),
+      bslib::nav_panel("Visualize Player Stats",icon=bsicons::bs_icon("graph-up"),mod_nba_viz_ui("nba_viz_1")),
       bslib::nav_panel("Player Point Prediction",icon=bsicons::bs_icon("person-standing"),mod_nba_pred_ui("nba_pred_1"))
     )
   )

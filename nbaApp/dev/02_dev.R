@@ -25,7 +25,7 @@ golem::add_module(name="nba_pred",with_test = FALSE)
 
 ## Add helper functions ----
 ## Creates fct_* and utils_*
-golem::add_fct("helpers", with_test = TRUE)
+golem::add_fct("mods", with_test = FALSE)
 golem::add_utils("helpers", with_test = TRUE)
 
 ## External resources

@@ -15,7 +15,7 @@ mod_nba_pred_ui <- function(id) {
         shiny::selectInput(ns("team"),label="Select Current Team",choices=c(NULL)),
         shiny::selectInput(ns("player"),label="Select Player for Prediction",choices=c(NULL)),
         shiny::dateRangeInput(ns("dates"),label="Select Date Range for Model Training",min=NULL,max=NULL),
-        shiny::selectInput(ns("mod_type"),label="Select Model Type",choices=c("Lasso Regression","Random Forest")),
+        shiny::selectInput(ns("mod_type"),label="Select Model Type",choices=c("Lasso Regression","Random Forest","Neural Network")),
         shiny::actionButton(ns("train"),label="Train Model")
       ),
       bslib::card(
@@ -73,7 +73,7 @@ mod_nba_pred_server <- function(id,out){
       df_2026(df_2026)
     })
 
-    # When the team is updated, list played on that team
+    # When the team is updated, list players on that team
     shiny::observeEvent(input$team,{
       if(input$team!=""){
         dfTeam <- df_2026()
@@ -87,7 +87,7 @@ mod_nba_pred_server <- function(id,out){
       if(input$player!="" & input$team!=""){
         df <- out()
         dfPlayer <- df |> dplyr::filter(namePlayer==input$player)
-        shiny::updateDateRangeInput(session=session,"dates",min=min(dfPlayer$dateGame),max=max(dfPlayer$dateGame),start=min(dfPlayer$dateGame),end=max(dfPlayer$dateGame)-30)
+        shiny::updateDateRangeInput(session=session,"dates",min=min(dfPlayer$dateGame),max=max(dfPlayer$dateGame),start=min(dfPlayer$dateGame),end=max(dfPlayer$dateGame)-30) # Make the auto train df - 30 days from last game
       }
     })
 
@@ -99,63 +99,48 @@ mod_nba_pred_server <- function(id,out){
       df_pred <- subset(df_pred,namePlayer==input$player)
       df_pred <- df_pred[c("yearSeason","nameTeam","isB2B","locationGame","slugOpponent","numberGamePlayerSeason","countDaysRestPlayer","pts","dateGame")]
 
-      # Convert factors to dummy numeric
-      df_pred$nameTeam <- as.numeric(as.factor(df_pred$nameTeam))
+      # Transform 0/1 variables
       df_pred$isB2B <- as.numeric(as.factor(df_pred$isB2B))
-      df_pred$isB2B <- ifelse(df_pred$isB2B==1,0,1)
+      df_pred$isB2B <- ifelse(df_pred$isB2B == 1, 0, 1)
       df_pred$locationGame <- as.numeric(as.factor(df_pred$locationGame))
-      df_pred$locationGame <- ifelse(df_pred$locationGame==1,0,1)
-      df_pred$slugOpponent <- as.numeric(as.factor(df_pred$slugOpponent))
+      df_pred$locationGame <- ifelse(df_pred$locationGame == 1, 0, 1)
+
+      # Categorical variables
+      df_pred <- if(length(unique(df_pred$nameTeam))<=1){
+        df_pred$nameTeam <- NULL
+        # Transform categorical variables
+        df_pred <- fastDummies::dummy_cols(df_pred,
+                                           select_columns = c("slugOpponent"),
+                                           remove_selected_columns = TRUE,
+                                           remove_first_dummy = FALSE)
+      }
+      else{
+        # Transform categorical variables
+        df_pred <- fastDummies::dummy_cols(df_pred,
+                                           select_columns = c("nameTeam", "slugOpponent"),
+                                           remove_selected_columns = TRUE,
+                                           remove_first_dummy = FALSE)
+      }
 
       # Train/test split
       df_train <- df_pred |> dplyr::filter(dateGame <= input$dates[2] & dateGame >= input$dates[1])
       df_test <- df_pred |> dplyr::filter(dateGame > input$dates[2])
 
-      # Prep train data
-      y <- df_train$pts
-      X <- df_train
-      X$pts <- NULL
-      X$dateGame <- NULL
+      # Train fxn
+      train_out <- mods_train(df_train,input$mod_type)
+      mod_out <- train_out[[1]]
+      train_out <- train_out[[2]]
 
-      # Fit lasso regression or RF regression
-      if(input$mod_type=="Lasso Regression"){
-        X <- as.matrix(X)
-        mod_out <- glmnet::cv.glmnet(X, y, alpha = 1)
-      }
-      else if(input$mod_type=="Random Forest"){
-        mod_out <- randomForest::randomForest(X,y)
-      }
-
-      # Generate predictions using training data
-      preds_train <- predict(mod_out, newx = X, s = "lambda.min")
       # If test data are available...
       if(nrow(df_test)>0){
+        preds <- mods_test(df_test,df_train,train_out,mod_out,input$mod_type)
+        preds_test <- preds |> dplyr::filter(dataset=="Test")
 
-        # Prep test data
-        X_test <- df_test
-        X_test$pts <- NULL
-        X_test$dateGame <- NULL
-        if(input$mod_type=="Lasso Regression"){
-          X_test <- as.matrix(X_test)
-        }
-
-        # Generate test data predictions
-        preds_test <- predict(mod_out, X_test, s = "lambda.min")
-
-        # Wrangle predictions
-        preds_test <- as.data.frame(preds_test)
-        preds_test$dataset <- "Test"
-        preds_train <- as.data.frame(preds_train)
-        preds_train$dataset <- "Train"
-        colnames(preds_test) <- colnames(preds_train)
-        preds <- rbind(preds_train,preds_test)
-        colnames(preds) <- c("pred","dataset")
-        df_all <- rbind(df_train,df_test)
-        preds <- cbind(preds,df_all)
         # RMSE/MAE calculations
         mae <- mean(abs(df_test$pts - preds_test[[1]]))
         rmse <- sqrt(mean((df_test$pts - preds_test[[1]])^2))
       }
+      # If test data are not available
       else{
         shiny::showModal(
           shiny::modalDialog(
@@ -171,18 +156,18 @@ mod_nba_pred_server <- function(id,out){
         rmse <- sqrt(mean((preds$pts - preds$pred)^2))
       }
 
-      # Plot predictions
-      preds_out <- ggplot2::ggplot(preds,ggplot2::aes(x=pred,y=pts,shape=dataset,color=dataset,text=paste("Predicted Points: ",round(pred,3),"\nPoints Made: ",round(pts,3),"\nDataset: ",dataset,sep="")))+
-        ggplot2::geom_point(size=2)+
+      # Model eval plot
+      preds_out <- ggplot2::ggplot(preds,ggplot2::aes(x=pred,y=pts,shape=dataset,fill=dataset,text=paste("Predicted Points: ",round(pred,3),"\nPoints Made: ",round(pts,3),"\nDataset: ",dataset,sep="")))+
+        ggplot2::geom_point(size=2,color="black")+
         ggplot2::geom_abline(intercept=0,slope=1,linetype="dashed")+
         ggplot2::theme_bw(base_size=14)+
         ggplot2::xlab("Predicted Points")+
         ggplot2::ylab("Points Made")+
-        ggplot2::scale_color_manual(name="Dataset",values=c("red3","dodgerblue"),breaks=c("Test","Train"))+
-        ggplot2::scale_shape_manual(name="Dataset",values=c(17,16),breaks=c("Test","Train"))+
+        ggplot2::scale_fill_manual(name="Dataset",values=c("red3","dodgerblue"),breaks=c("Test","Train"))+
+        ggplot2::scale_shape_manual(name="Dataset",values=c(24,21),breaks=c("Test","Train"))+
         ggplot2::ggtitle(paste(input$player))
 
-      # Render eval plot
+      # Render model eval plot
       output$mod_out <- plotly::renderPlotly({
         plotly::ggplotly(preds_out,tooltip = "text")
       })
@@ -191,73 +176,84 @@ mod_nba_pred_server <- function(id,out){
       output$mae_out <- shiny::renderText({round(mae,3)})
       output$rmse_out <- shiny::renderText({round(rmse,3)})
 
-      # Update prediction selections
+      # Update prediction selections - do not allow train team to play themselves
       df_2026 <- df_2026()
       df_2026 <- df_2026 |> dplyr::filter(nameTeam!=input$team)
       shiny::updateSelectInput(session=session,"next_opponent",choices=c(unique(df_2026$nameTeam)))
     })
 
+    # When prediction for next game is executed
     shiny::observeEvent(input$pred_go,{
-      browser()
+
       # Select predictor variables
       df_pred <- out()
       df_pred <- subset(df_pred,namePlayer==input$player)
       df_pred <- df_pred[c("yearSeason","nameTeam","isB2B","locationGame","slugOpponent","numberGamePlayerSeason","countDaysRestPlayer","pts","dateGame")]
-
-      # Make df of codes
       df_tmp <- df_pred
-      df_tmp$nameTeam2 <- as.numeric(as.factor(df_tmp$nameTeam))
-      df_tmp$isB2B2 <- as.numeric(as.factor(df_tmp$isB2B))
-      df_tmp$isB2B2 <- ifelse(df_tmp$isB2B2==1,0,1)
-      df_tmp$locationGame2 <- as.numeric(as.factor(df_tmp$locationGame))
-      df_tmp$locationGame2 <- ifelse(df_tmp$locationGame2==1,0,1)
-      df_tmp$slugOpponent2 <- as.numeric(as.factor(df_tmp$slugOpponent))
 
-      # Convert factors to dummy numeric
-      df_pred$nameTeam <- as.numeric(as.factor(df_pred$nameTeam))
+      # Transform 0/1 variables
       df_pred$isB2B <- as.numeric(as.factor(df_pred$isB2B))
-      df_pred$isB2B <- ifelse(df_pred$isB2B==1,0,1)
+      df_pred$isB2B <- ifelse(df_pred$isB2B == 1, 0, 1)
       df_pred$locationGame <- as.numeric(as.factor(df_pred$locationGame))
-      df_pred$locationGame <- ifelse(df_pred$locationGame==1,0,1)
-      df_pred$slugOpponent <- as.numeric(as.factor(df_pred$slugOpponent))
+      df_pred$locationGame <- ifelse(df_pred$locationGame == 1, 0, 1)
 
-        # Prep train data
-        y <- df_pred$pts
-        X <- df_pred
-        X$pts <- NULL
-        X$dateGame <- NULL
+      # Categorical variables
+      df_pred <- if(length(unique(df_pred$nameTeam))<=1){
+        df_pred$nameTeam <- NULL
+        # Transform categorical variables
+        df_pred <- fastDummies::dummy_cols(df_pred,
+                                           select_columns = c("slugOpponent"),
+                                           remove_selected_columns = TRUE,
+                                           remove_first_dummy = FALSE)
+      }
+      else{
+        # Transform categorical variables
+        df_pred <- fastDummies::dummy_cols(df_pred,
+                                           select_columns = c("nameTeam", "slugOpponent"),
+                                           remove_selected_columns = TRUE,
+                                           remove_first_dummy = FALSE)
+      }
 
-        # Fit lasso regression or RF regression
-        if(input$mod_type=="Lasso Regression"){
-          X <- as.matrix(X)
-          mod_out <- glmnet::cv.glmnet(X, y, alpha = 1)
-        }
-        else if(input$mod_type=="Random Forest"){
-          mod_out <- randomForest::randomForest(X,y)
-        }
+      # Train on all available data
+      df_train <- df_pred
 
-        max_date <- max(df_pred$dateGame)
-        b2b_num <- df_tmp |> dplyr::distinct(isB2B,isB2B2) |> dplyr::arrange(isB2B)
-        loc_num <- df_tmp |> dplyr::distinct(locationGame,locationGame2) |> dplyr::filter(locationGame==input$home_away)
-        opponent_num <- out()
-        opponent_num <- opponent_num |> dplyr::distinct(nameTeam,slugTeam)
-        opponent <- df_tmp |> dplyr::distinct(slugOpponent,slugOpponent2)
-        colnames(opponent_num)[2] <- "slugOpponent"
-        opponent_num <- dplyr::left_join(opponent_num,opponent)
-        opponent_num <- opponent_num |> dplyr::filter(nameTeam==input$next_opponent)
-        df_num <- df_pred |> dplyr::filter(yearSeason==2026)
-        df_num <- max(df_num$numberGamePlayerSeason)
-        rest_num <- df_pred |> dplyr::arrange(yearSeason,dateGame)
-        rest_num <- as.numeric(input$next_game - max(rest_num$dateGame))
-        team_num <- df_tmp |> dplyr::distinct(nameTeam,nameTeam2) |> dplyr::filter(nameTeam==input$team)
+      # Train fxn
+      train_out <- mods_train(df_train,input$mod_type)
+      mod_out <- train_out[[1]]
+      browser()
 
-        predsData <- data.frame(yearSeason=2026,nameTeam=team_num$nameTeam2,isB2B=ifelse(max_date+1!=input$next_game,b2b_num$isB2B2[1],b2b_num$isB2B2[2]),locationGame=loc_num$locationGame2,slugOpponent=opponent_num$slugOpponent2,numberGamePlayerSeason=df_num,countDaysRestPlayer=rest_num)
-        predsData <- subset(predsData,!is.na(slugOpponent))
+      # Obtain new df based on prediction inputs
+      max_date <- max(df_pred$dateGame)
 
-        predsData <- as.matrix(predsData)
-        p <- predict(mod_out,predsData)
-        all <- out()
-        all <- all |> dplyr::filter(namePlayer==input$player,yearSeason==max(all$yearSeason))
+      df_tmp$isB2B2 <- as.numeric(as.factor(df_tmp$isB2B))
+      df_tmp$isB2B2 <- ifelse(df_tmp$isB2B2 == 1, 0, 1)
+      b2b_num <- df_tmp |> dplyr::distinct(isB2B,isB2B2) |> dplyr::arrange(isB2B)
+
+      df_tmp$locationGame2 <- as.numeric(as.factor(df_tmp$locationGame))
+      df_tmp$locationGame2 <- ifelse(df_tmp$locationGame2 == 1, 0, 1)
+      loc_num <- df_tmp |> dplyr::distinct(locationGame,locationGame2) |> dplyr::filter(locationGame==input$home_away)
+      opponent_num <- out()
+      opponent_num <- opponent_num |> dplyr::distinct(nameTeam,slugTeam)
+      opponent <- df_tmp |> dplyr::distinct(slugOpponent,slugOpponent2)
+      colnames(opponent_num)[2] <- "slugOpponent"
+      opponent_num <- dplyr::left_join(opponent_num,opponent)
+      opponent_num <- opponent_num |> dplyr::filter(nameTeam==input$next_opponent)
+      df_num <- df_pred |> dplyr::filter(yearSeason==2026)
+      df_num <- max(df_num$numberGamePlayerSeason)
+      rest_num <- df_pred |> dplyr::arrange(yearSeason,dateGame)
+      rest_num <- as.numeric(input$next_game - max(rest_num$dateGame))
+      team_num <- df_tmp |> dplyr::distinct(nameTeam,nameTeam2) |> dplyr::filter(nameTeam==input$team)
+
+      predsData <- data.frame(yearSeason=2026,nameTeam=team_num$nameTeam2,isB2B=ifelse(max_date+1!=input$next_game,b2b_num$isB2B2[1],b2b_num$isB2B2[2]),locationGame=loc_num$locationGame2,slugOpponent=opponent_num$slugOpponent2,numberGamePlayerSeason=df_num,countDaysRestPlayer=rest_num)
+      predsData <- subset(predsData,!is.na(slugOpponent))
+
+      # Generate pts prediction
+      predsData <- as.matrix(predsData)
+      p <- predict(mod_out,predsData)
+
+      # Obtain full df for player
+      all <- out()
+      all <- all |> dplyr::filter(namePlayer==input$player,yearSeason==max(all$yearSeason))
         p <- as.data.frame(p)
         p$dateGame <- input$next_game
         p$slugOpponent <- opponent_num$slugOpponent
@@ -273,6 +269,7 @@ mod_nba_pred_server <- function(id,out){
             ggplot2::aes(
               fill = locationGame,
               shape = type,
+              size=2,
               text = paste("Points: ", round(pts, 3),
                            "\nDate of Game: ", dateGame,
                            "\nOpponent: ", slugOpponent,
@@ -282,7 +279,7 @@ mod_nba_pred_server <- function(id,out){
             size = 2
           ) +
           ggplot2::scale_fill_manual(name = "Location of Game",
-                                     values = c("lightgreen", "deepskyblue")) +
+                                     values = c("lightgreen", "orange1")) +
           ggplot2::scale_shape_manual(name = "",
                                       values = c(24, 21)) +
           ggplot2::theme_bw(base_size = 14) +
@@ -292,7 +289,8 @@ mod_nba_pred_server <- function(id,out){
         output$mod_pred <- plotly::renderPlotly({
           plotly::ggplotly(ggp, tooltip = "text")
         })
-    })
+      })
+
   })
 }
 
